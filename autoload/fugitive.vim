@@ -488,6 +488,17 @@ function! s:JobOpts(cmd, env) abort
   endif
 endfunction
 
+function! s:PrepareJob(...) abort
+  let [dir, env, git, cmd] = call('fugitive#PrepareDirEnvGitArgv', a:000)
+  let tree = s:Tree(dir)
+  if empty(tree) || index(cmd, '--') == len(cmd) - 1
+    call extend(cmd, git + ['--git-dir=' . FugitiveGitPath(dir)], 'keep')
+  else
+    call extend(cmd, git + ['-C', FugitiveGitPath(tree)], 'keep')
+  endif
+  return s:JobOpts(cmd, env)
+endfunction
+
 function! s:BuildShell(dir, env, git, args) abort
   let cmd = copy(a:args)
   let tree = s:Tree(a:dir)
@@ -1529,18 +1540,36 @@ function! fugitive#setfperm(url, perm) abort
 endfunction
 
 function! s:TempCmd(out, cmd) abort
-  try
-    let cmd = (type(a:cmd) == type([]) ? fugitive#Prepare(a:cmd) : a:cmd)
-    let redir = ' > ' . a:out
-    if (s:winshell() || &shellcmdflag ==# '-Command') && !has('nvim')
-      let cmd_escape_char = &shellxquote == '(' ?  '^' : '^^^'
-      return s:SystemError('cmd /c "' . s:gsub(cmd, '[<>%]', cmd_escape_char . '&') . redir . '"')
-    elseif &shell =~# 'fish'
-      return s:SystemError(' begin;' . cmd . redir . ';end ')
-    else
-      return s:SystemError(' (' . cmd . redir . ') ')
-    endif
-  endtry
+  let [argv, jopts] = s:PrepareJob(a:cmd)
+  let exit = []
+  if exists('*jobstart')
+    call extend(jopts, {
+          \ 'stdout_buffered': v:true,
+          \ 'stderr_buffered': v:true,
+          \ 'on_exit': { j, code, _ -> add(exit, code) }})
+    let job = jobstart(argv, jopts)
+    call jobwait([job])
+    call writefile(jopts.stdout, a:out, 'b')
+    return [join(jopts.stderr, "\n"), exit[0]]
+  elseif exists('*job_start')
+    let err = []
+    call extend(jopts, {
+          \ 'out_io': 'file',
+          \ 'out_name': a:out,
+          \ 'err_cb': { j, str -> add(err, str . "\n") },
+          \ 'exit_cb': { j, code -> add(exit, code) }})
+    let job = job_start(argv, jopts)
+    while ch_status(job) !=# 'closed' || job_status(job) ==# 'run'
+      sleep 1m
+    endwhile
+    return [join(err, ''), exit[0]]
+  endif
+  if s:winshell() || &shell !~# 'sh' || &shell =~? 'fish\|powershell'
+    throw 'fugitive: Vim 8 or higher required to use ' . &shell
+  else
+    let cmd = fugitive#Prepare(a:cmd)
+    return s:SystemError(' (' . cmd . ' >' . a:out . ') ')
+  endif
 endfunction
 
 if !exists('s:blobdirs')
